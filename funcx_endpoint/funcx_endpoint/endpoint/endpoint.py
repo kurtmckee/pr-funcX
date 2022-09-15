@@ -21,6 +21,9 @@ from funcx.errors import FuncxResponseError
 from funcx.sdk.client import FuncXClient
 from funcx_endpoint.endpoint import default_config as endpoint_default_config
 from funcx_endpoint.endpoint.interchange import EndpointInterchange
+from funcx_endpoint.endpoint.rabbit_mq.command_queue_subscriber import (
+    CommandQueueSubscriber,
+)
 from funcx_endpoint.endpoint.register_endpoint import register_endpoint
 from funcx_endpoint.endpoint.result_store import ResultStore
 from funcx_endpoint.logging_config import setup_logging
@@ -31,7 +34,7 @@ log = logging.getLogger(__name__)
 _DEFAULT_FUNCX_DIR = str(pathlib.Path.home() / ".funcx")
 
 
-class Endpoint:
+class Endpoint2:
     """
     Endpoint is primarily responsible for configuring, launching and stopping
     the Endpoint.
@@ -499,3 +502,15 @@ class Endpoint:
         for endpoint_name, endpoint_info in endpoints.items():
             table.add_row([endpoint_name, endpoint_info["status"], endpoint_info["id"]])
         print(table.draw())
+
+
+class Endpoint:
+    def __init__(self):
+        # Quick test: can we assume a user?  -> multi-tenant
+        # Handle signals!
+
+        self._command = CommandQueueSubscriber(
+            endpoint_id="ep_id.command",
+            queue_info={"connection_url": "amqp://localhost/%2F"},
+        )
+        self._command.start()
