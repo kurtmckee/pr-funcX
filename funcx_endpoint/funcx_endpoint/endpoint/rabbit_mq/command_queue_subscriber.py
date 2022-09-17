@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import queue
 import threading
 import typing as t
 
@@ -21,24 +22,25 @@ class CommandQueueSubscriber(threading.Thread):
     def __init__(
         self,
         *,
-        endpoint_id: str,
         queue_info: dict,
-        # external_queue: multiprocessing.Queue,
+        command_queue: queue.Queue,
         quiesce_event: threading.Event,
     ):
         super().__init__()
         self.status = SubscriberProcessStatus.parent
 
-        self.endpoint_id = endpoint_id
         self.queue_info = queue_info
-        # self.external_queue = external_queue
+        self._command_queue = command_queue
         self._quiesce_event = quiesce_event
-        # self._channel_closed = multiprocessing.Event()
-        # self._cleanup_complete = multiprocessing.Event()
+        self._to_ack: queue.Queue[int] = queue.Queue()
+        self._channel_closed = threading.Event()
+        self._cleanup_complete = threading.Event()
 
         self._connection: pika.SelectConnection | None = None
         self._channel: Channel | None = None
         self._consumer_tag: str | None = None
+
+        self._watcher_poll_period_s = 1
 
     def run(self):
         try:
@@ -76,7 +78,11 @@ class CommandQueueSubscriber(threading.Thread):
         channel.add_on_close_callback(self._on_channel_closed)
         channel.add_on_cancel_callback(self._on_consumer_cancelled)
 
-        log.info(f"Channel opened: {channel}; begin consuming messages.")
+        log.info(
+            "Channel %s opened (%s); begin consuming messages.",
+            channel.channel_number,
+            channel.connection.params,
+        )
         self._start_consuming()
 
     def _on_channel_closed(self, channel: Channel, exception: Exception):
@@ -113,7 +119,7 @@ class CommandQueueSubscriber(threading.Thread):
         self._consumer_tag = self._channel.basic_consume(
             queue=self.queue_info["queue"],
             on_message_callback=self._on_message,
-            exclusive=True,
+            # exclusive=True,
         )
 
     def _on_consumer_cancelled(self, frame: Method[Basic.CancelOk]):
@@ -145,18 +151,16 @@ class CommandQueueSubscriber(threading.Thread):
             body,
         )
 
-        # Not sure if we need to do this in a locked context,
-        # rabbit's ACK system should make sure you don't lose tasks.
         try:
-            self.external_queue.put(body)
+            self._command_queue.put((basic_deliver.delivery_tag, properties, body))
         except Exception:
             # No sense in waiting for the RMQ default 30m timeout; let it know
             # *now* that this message failed.
-            log.exception("External queue put failed")
+            log.exception("Command queue put failed")
             channel.basic_nack(basic_deliver.delivery_tag, requeue=True)
-        else:
-            channel.basic_ack(basic_deliver.delivery_tag)
-            log.debug("Acknowledged message: %s", basic_deliver.delivery_tag)
+
+    def ack(self, msg_tag: int):
+        self._to_ack.put(msg_tag)
 
     def _on_cancelok(self, _frame: Method[Basic.CancelOk]):
         log.info("RabbitMQ acknowledged the cancellation of the consumer")
@@ -178,16 +182,12 @@ class CommandQueueSubscriber(threading.Thread):
         log.debug("waiting until channel is closed (timeout=1 second)")
         if not self._channel_closed.wait(1.0):
             log.warning("reached timeout while waiting for channel closed")
-        log.debug("closing connection to mp queue")
-        self.external_queue.close()
-        log.debug("joining mp queue background thread")
-        self.external_queue.join_thread()
         log.info("shutdown done, setting cleanup event")
         self._cleanup_complete.set()
 
     def event_watcher(self):
         """Polls the quiesce_event periodically to trigger a shutdown"""
-        if self.quiesce_event.is_set():
+        if self._quiesce_event.is_set():
             log.info("Shutting down task queue reader due to quiesce event.")
             try:
                 self._shutdown()
@@ -195,23 +195,27 @@ class CommandQueueSubscriber(threading.Thread):
                 log.exception("error while shutting down")
                 raise
             log.info("Shutdown complete")
-        else:
-            self._connection.ioloop.call_later(
-                self._watcher_poll_period, self.event_watcher
-            )
+            return
 
-    def handle_sigterm(self, sig_num, curr_stack_frame):
-        log.warning("Received SIGTERM, setting stop event")
-        self.quiesce_event.set()
+        try:
+            while True:
+                delivery_tag = self._to_ack.get(block=False)
+                self._channel.basic_ack(delivery_tag)
+                log.debug("Acknowledged command: %s", delivery_tag)
+        except queue.Empty:
+            pass
+
+        self._connection.ioloop.call_later(
+            self._watcher_poll_period_s, self.event_watcher
+        )
 
     def stop(self) -> None:
         """stop() is called by the parent to shutdown the subscriber"""
         log.info("Stopping")
-        self.quiesce_event.set()
+        self._quiesce_event.set()
         log.info("Waiting for cleanup_complete")
-        if not self._cleanup_complete.wait(2 * self._watcher_poll_period):
+        if not self._cleanup_complete.wait(2 * self._watcher_poll_period_s):
             log.warning("Reached timeout while waiting for cleanup complete")
         # join shouldn't block if the above did not raise a timeout
         self.join()
-        self.close()
         log.info("Cleanup done")

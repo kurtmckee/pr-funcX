@@ -3,11 +3,16 @@ import json
 import logging
 import os
 import pathlib
+import queue
 import shutil
 import signal
+import subprocess
 import sys
-import typing
+import threading
+import time
+import typing as t
 import uuid
+from datetime import datetime
 from string import Template
 
 import click
@@ -28,13 +33,19 @@ from funcx_endpoint.endpoint.register_endpoint import register_endpoint
 from funcx_endpoint.endpoint.result_store import ResultStore
 from funcx_endpoint.logging_config import setup_logging
 
+if t.TYPE_CHECKING:
+    # import pika.exceptions
+    # from pika.channel import Channel
+    # from pika.frame import Method
+    from pika.spec import BasicProperties
+
 log = logging.getLogger(__name__)
 
 
 _DEFAULT_FUNCX_DIR = str(pathlib.Path.home() / ".funcx")
 
 
-class Endpoint2:
+class Endpoint:
     """
     Endpoint is primarily responsible for configuring, launching and stopping
     the Endpoint.
@@ -206,10 +217,10 @@ class Endpoint2:
         # If we are running a full detached daemon then we will send the output to
         # log files, otherwise we can piggy back on our stdout
         if endpoint_config.config.detach_endpoint:
-            stdout: typing.TextIO = open(
+            stdout: t.TextIO = open(
                 os.path.join(endpoint_dir, endpoint_config.config.stdout), "a+"
             )
-            stderr: typing.TextIO = open(
+            stderr: t.TextIO = open(
                 os.path.join(endpoint_dir, endpoint_config.config.stderr), "a+"
             )
         else:
@@ -504,13 +515,168 @@ class Endpoint2:
         print(table.draw())
 
 
-class Endpoint:
-    def __init__(self):
+class MasterEndpoint:
+    def __init__(self, funcx_dir=None, debug=False):
         # Quick test: can we assume a user?  -> multi-tenant
-        # Handle signals!
 
+        self._time_to_stop = False
+        self.funcx_dir = funcx_dir
+        self._kill_event = threading.Event()
+
+        self._command_queue: queue.Queue[
+            tuple[int, BasicProperties, bytes]
+        ] = queue.Queue()
+        self._command_quiesce_event = threading.Event()
+        client_props = "client_properties=%7B%27connection_name%27%3A+%27cqs%27%7D"
+        cq_url = f"amqp://guest:guest@localhost:5672/%2F?{client_props}"
         self._command = CommandQueueSubscriber(
-            endpoint_id="ep_id.command",
-            queue_info={"connection_url": "amqp://localhost/%2F"},
+            queue_info={"connection_url": cq_url, "queue": "ep_id.command"},
+            command_queue=self._command_queue,
+            quiesce_event=self._command_quiesce_event,
         )
+
+        signal.signal(signal.SIGTERM, self.sighandler)
+        signal.signal(signal.SIGINT, self.sighandler)
+        print("ADD MORE HANDLERS")
+
+    def sighandler(self, sig_num, curr_stack_frame):
+        self._time_to_stop = True
+
+    def start_endpoint(self, *args):
+        try:
+            self._start_endpoint(*args)
+        except Exception:
+            log.exception("Unhandled exception; shutting down endpoint master")
+            self._kill_event.set()
+            self._command_quiesce_event.set()
+
+    def _start_endpoint(self, *args):
         self._command.start()
+
+        max_skew_s = 180  # 3 minutes
+        while not self._kill_event.is_set():
+            if self._command_quiesce_event.is_set():
+                print("DYING BECAUSE COMMAND KILLED")
+                self._kill_event.set()
+
+            if self._time_to_stop:
+                self._command_quiesce_event.set()
+                self._kill_event.set()
+                continue
+
+            try:
+                _command = self._command_queue.get(timeout=1.0)
+            except queue.Empty:
+                print(f"\r{time.strftime('%c')}", end="", flush=True)
+                continue
+
+            now = round(time.time())
+
+            try:
+                d_tag, props, body = _command
+                server_cmd_ts = props.timestamp
+                if props.content_type != "application/json":
+                    raise ValueError("Invalid message type; expecting JSON")
+                log.debug(
+                    "\n  HEADERS (R): %s"
+                    "\n  HEADERS    : %s"
+                    "\n  CONTENT_TYPE    : %s"
+                    "\n  CONTENT_ENCODING: %s"
+                    "\n  TIMESTAMP: %s (%s)"
+                    "\n  PROPS    : %s",
+                    repr(props.headers),
+                    props.headers,
+                    props.content_type,
+                    props.content_encoding,
+                    props.timestamp,
+                    type(props.timestamp),
+                    props,
+                )
+
+                msg = json.loads(body)
+            except Exception:
+                log.exception("Unable to deserialize funcX services command")
+                self._command.ack(d_tag)
+                continue
+
+            now = round(time.time())
+            if abs(now - server_cmd_ts) > max_skew_s:
+                server_pp_ts = datetime.fromtimestamp(server_cmd_ts).strftime("%c")
+                endp_pp_ts = datetime.fromtimestamp(now).strftime("%c")
+                log.warning(
+                    "Ignoring command from server"
+                    "\nCommand too old or skew between system clocks is too large."
+                    f"\n  Command timestamp:  {server_cmd_ts:,} ({server_pp_ts})"
+                    f"\n  Endpoint timestamp: {now:,} ({endp_pp_ts})"
+                )
+                self._command.ack(d_tag)
+                continue
+
+            try:
+                command = msg.get("command")
+                command_args = msg.get("args", [])
+                command_kwargs = msg.get("kwargs", {})
+                log.info(
+                    f"Requested to execute command: {command} ("
+                    f"args: {command_args}, "
+                    f"kwargs: {command_kwargs})"
+                )
+
+                command_func = getattr(self, command)
+                command_func(*command_args, **command_kwargs)
+                log.debug("Command successfully initiated.")
+            except Exception:
+                print("TODO: SEND BACK TO WEB SERVICE?")
+                log.exception(
+                    f"Unable to execute command: {command}\n"
+                    f"    args: {command_args}\n"
+                    f"  kwargs: {command_kwargs}"
+                )
+
+            self._command.ack(d_tag)
+
+    def manage_executor(
+        self, local_username: str, endpoint_args: list[str | bytes], **kwargs
+    ):
+        import pwd
+
+        pw_rec = pwd.getpwnam(local_username)
+        udir, uid, gid = pw_rec.pw_dir, pw_rec.pw_uid, pw_rec.pw_gid
+        uname = pw_rec.pw_name
+
+        proc_args = ["funcx-endpoint", *endpoint_args]
+        env = kwargs.get("env", {})
+        env.update({"HOME": udir, "USER": uname})
+        if os.path.isdir(udir):
+            env["PWD"] = udir
+        else:
+            udir = None
+
+        pid = os.fork()
+        if pid:
+
+            def wait_for_pid():
+                os.waitpid(pid, 0)
+                log.debug(f"Process reaped: {pid}")
+
+            threading.Thread(target=wait_for_pid, daemon=True).start()
+            return
+
+        try:
+            os.setpgrp()
+            os.setresgid(gid, gid, gid)
+            os.setresuid(uid, uid, uid)
+            subprocess.Popen(
+                proc_args,
+                user=uid,
+                group=gid,
+                cwd=udir,
+                env=env,
+                start_new_session=True,
+                close_fds=True,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        finally:
+            exit(0)
