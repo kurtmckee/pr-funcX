@@ -31,6 +31,28 @@ from funcx_endpoint.endpoint.utils.config import Config
 if t.TYPE_CHECKING:
     from pika.spec import BasicProperties
 
+if hasattr(os, "setresgid"):
+    _setresgid = os.setresgid
+elif hasattr(os, "setregid"):
+    # likely on macOS; insert shim ...
+    def _setresgid(_rgid, egid, sgid):
+        rgid = sgid
+        return os.setregid(rgid, egid)
+
+else:
+    raise RuntimeError("Missing os.setresgid or os.setregid; unable to continue")
+
+if hasattr(os, "setresuid"):
+    _setresuid = os.setresuid
+elif hasattr(os, "setreuid"):
+    # likely on macOS; insert shim ...
+    def _setresuid(_ruid, euid, suid):
+        ruid = suid
+        return os.setregid(ruid, euid)
+
+else:
+    raise RuntimeError("Missing os.setresuid or os.setreuid; unable to continue")
+
 
 log = logging.getLogger(__name__)
 
@@ -231,16 +253,16 @@ class EndpointManager:
                 proc_ident = f"PID: {pid}, UID: {uid}, GID: {gid}, User: {uname}"
                 log.info(f"{msg_prefix} of user endpoint ({proc_ident}) [{proc_args}]")
                 try:
-                    os.setresgid(gid, gid, -1)
-                    os.setresuid(uid, uid, -1)
+                    _setresgid(gid, gid, -1)
+                    _setresuid(uid, uid, -1)
                     os.killpg(os.getpgid(pid), signum)
                 except Exception as e:
                     log.warning(
                         f"User endpoint signal failed: {e} ({proc_ident}) [{proc_args}]"
                     )
                 finally:
-                    os.setresuid(proc_uid, proc_uid, -1)
-                    os.setresgid(proc_gid, proc_gid, -1)
+                    _setresuid(proc_uid, proc_uid, -1)
+                    _setresgid(proc_gid, proc_gid, -1)
 
             deadline = time.time() + 10
             while self._child_args and time.time() < deadline:
@@ -430,10 +452,11 @@ class EndpointManager:
             # can't -- for whatever reason -- that's a problem.  So, don't ignore the
             # potential error.
             log.debug("Setting process group for %s to %s", pid, gid)
-            os.setresgid(gid, gid, gid)  # raises (good!) on error
+            _setresgid(gid, gid, gid)  # raises (good!) on error
             exit_code += 1
+
             log.debug("Setting process uid for %s to %s (%s)", pid, uid, uname)
-            os.setresuid(uid, uid, uid)  # raises (good!) on error
+            _setresuid(uid, uid, uid)  # raises (good!) on error
             exit_code += 1
 
             os.setsid()
