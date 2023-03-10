@@ -520,7 +520,13 @@ class EndpointManager:
             # last-ditch attempt at sharing "what went wrong where" to the
             # parent process.
             exit_code += 1
-            os.closerange(3, hard_no)
+            try:
+                hard_no = max(hard_no, 1048576)  # handle hard_no "too-small"
+                os.closerange(3, hard_no)
+            except OverflowError:
+                # intentionally don't catch error in this second go-round
+                hard_no = min(hard_no, 1048576)  # handle hard_no "too-large"
+                os.closerange(3, hard_no)
 
             exit_code += 1
             os.execvpe(proc_args[0], args=proc_args, env=env)
