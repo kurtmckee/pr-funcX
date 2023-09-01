@@ -3,10 +3,9 @@ from __future__ import annotations
 import logging
 
 import globus_sdk
-from globus_sdk.scopes import AuthScopes
-
 from globus_compute_sdk.sdk.login_manager.protocol import LoginManagerProtocol
 from globus_compute_sdk.sdk.web_client import WebClient
+from globus_sdk.scopes import AuthScopes
 
 from .manager import ComputeScopeBuilder
 
