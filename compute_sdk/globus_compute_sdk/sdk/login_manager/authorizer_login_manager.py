@@ -3,15 +3,19 @@ from __future__ import annotations
 import logging
 
 import globus_sdk
+from globus_sdk.scopes import AuthScopes
+
+from globus_compute_sdk.sdk.login_manager.manager import LoginManager
 from globus_compute_sdk.sdk.login_manager.protocol import LoginManagerProtocol
 from globus_compute_sdk.sdk.web_client import WebClient
-from globus_sdk.scopes import AuthScopes
 
 from .manager import ComputeScopeBuilder
 
 log = logging.getLogger(__name__)
 
 ComputeScopes = ComputeScopeBuilder()
+
+
 
 
 class AuthorizerLoginManager(LoginManagerProtocol):
@@ -38,7 +42,17 @@ class AuthorizerLoginManager(LoginManagerProtocol):
         )
 
     def ensure_logged_in(self):
-        return True
+        """Ensure authorizers for each of the required scopes are present."""
+
+        lm = LoginManager()
+
+        for server, _scopes in lm.login_requirements:
+            if server not in self.authorizers:
+                log.warning(f"Required authorizer for {server} is not present.")
+                raise LookupError(
+                    f"AuthorizerLoginManager could not find authorizer for {server}"
+                )
+        
 
     def logout(self):
-        log.warning("Logout cannot be invoked from a TokenLoginManager.")
+        log.warning("Logout cannot be invoked from an AuthorizerLoginManager.")

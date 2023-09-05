@@ -249,8 +249,9 @@ More details on the Globus Compute login manager prototcol are available `here. 
   # Create a Compute Client from these authorizers
   compute_login_manager = AuthorizerLoginManager(
       authorizers={ComputeScopes.resource_server: compute_auth,
-                   AuthScopes.openid: openid_auth}
+                   AuthScopes.resource_server: openid_auth}
   )
+  compute_login_manager.ensure_logged_in()
 
   gc = Client(login_manager=compute_login_manager)
   gce = Executor(endpoint_id=tutorial_endpoint, funcx_client=gc)
