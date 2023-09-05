@@ -3,19 +3,16 @@ from __future__ import annotations
 import logging
 
 import globus_sdk
-from globus_sdk.scopes import AuthScopes
-
 from globus_compute_sdk.sdk.login_manager.manager import LoginManager
 from globus_compute_sdk.sdk.login_manager.protocol import LoginManagerProtocol
 from globus_compute_sdk.sdk.web_client import WebClient
+from globus_sdk.scopes import AuthScopes
 
 from .manager import ComputeScopeBuilder
 
 log = logging.getLogger(__name__)
 
 ComputeScopes = ComputeScopeBuilder()
-
-
 
 
 class AuthorizerLoginManager(LoginManagerProtocol):
@@ -52,7 +49,6 @@ class AuthorizerLoginManager(LoginManagerProtocol):
                 raise LookupError(
                     f"AuthorizerLoginManager could not find authorizer for {server}"
                 )
-        
 
     def logout(self):
         log.warning("Logout cannot be invoked from an AuthorizerLoginManager.")
