@@ -41,14 +41,12 @@ class AuthorizerLoginManager(LoginManagerProtocol):
     def ensure_logged_in(self):
         """Ensure authorizers for each of the required scopes are present."""
 
-        lm = LoginManager()
-
-        for server, _scopes in lm.login_requirements:
+        for server in LoginManager.SCOPES:
             if server not in self.authorizers:
-                log.warning(f"Required authorizer for {server} is not present.")
+                log.error(f"Required authorizer for {server} is not present.")
                 raise LookupError(
-                    f"AuthorizerLoginManager could not find authorizer for {server}"
+                    f"{type(self).__name__} could not find authorizer for {server}"
                 )
 
     def logout(self):
-        log.warning("Logout cannot be invoked from an AuthorizerLoginManager.")
+        log.warning(f"Logout cannot be invoked from an {type(self).__name__}.")
