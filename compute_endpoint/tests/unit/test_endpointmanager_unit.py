@@ -705,6 +705,8 @@ def test_handles_invalid_command_gracefully(mocker, epmanager, cmd_name):
     }
     queue_item = (1, props, json.dumps(pld).encode())
 
+    mocker.patch(f"{_MOCK_BASE}pwd.getpwnam")
+
     em._command_queue = mocker.Mock()
     em._command_stop_event.set()
     em._command_queue.get.side_effect = [queue_item, queue.Empty()]
@@ -739,6 +741,8 @@ def test_handles_failed_command(mocker, epmanager):
         "user_opts": {"heartbeat": 10},
     }
     queue_item = (1, props, json.dumps(pld).encode())
+
+    mocker.patch(f"{_MOCK_BASE}pwd.getpwnam")
 
     em._command_queue = mocker.Mock()
     em._command_stop_event.set()
@@ -981,7 +985,7 @@ def test_run_as_same_user_fails_if_admin(successful_exec):
     em._allow_same_user = False
     kwargs = {"name": "some_endpoint_name"}
     with pytest.raises(InvalidUserError) as pyexc:
-        em.cmd_start_endpoint(pw_rec.pw_name, None, kwargs)
+        em.cmd_start_endpoint(pw_rec, None, kwargs)
 
     assert "UID is same as" in str(pyexc.value)
     assert "using a non-root user" in str(pyexc.value), "Expected suggested fix"
