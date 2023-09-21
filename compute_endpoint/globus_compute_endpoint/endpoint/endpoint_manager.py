@@ -18,6 +18,7 @@ import typing as t
 from datetime import datetime
 
 import globus_compute_sdk as GC
+from cachetools import TTLCache
 
 try:
     import pyprctl
@@ -76,6 +77,12 @@ class EndpointManager:
             tuple[int, BasicProperties, bytes]
         ] = queue.SimpleQueue()
         self._command_stop_event = threading.Event()
+
+        self._cached_cmd_start_args: TTLCache[
+            int, tuple[pwd.struct_passwd, list[str] | None, dict | None]
+        ] = TTLCache(maxsize=32768, ttl=30)
+
+        self._running_eps: set[t.Tuple[int, str]] = set()
 
         endpoint_uuid = Endpoint.get_or_create_endpoint_uuid(conf_dir, endpoint_uuid)
 
@@ -212,6 +219,38 @@ class EndpointManager:
                     log.warning(
                         f"Command terminated by signal: {-rc} ({pid}){proc_args}"
                     )
+
+                ep_name = "<unknown>"
+                for p, n in list(self._running_eps):
+                    if p == pid:
+                        ep_name = n
+                        self._running_eps.discard((p, n))
+
+                cmd_start_args = self._cached_cmd_start_args.pop(pid, None)
+                if not self._time_to_stop and cmd_start_args is not None:
+                    log.info(
+                        "Using cached arguments to start new "
+                        f"instance of user EP (name: {ep_name})"
+                    )
+
+                    try:
+                        cached_rec, args, kwargs = cmd_start_args
+                        updated_rec = pwd.getpwuid(cached_rec.pw_uid)
+                    except Exception as e:
+                        log.warning(
+                            "Unable to update local user information."
+                            f"  ({e.__class__.__name__}) {e}"
+                        )
+                    else:
+                        try:
+                            self.cmd_start_endpoint(updated_rec, args, kwargs)
+                        except Exception:
+                            log.exception(
+                                f"Unable to execute command: cmd_start_endpoint\n"
+                                f"    args: {args}\n"
+                                f"  kwargs: {kwargs}"
+                            )
+
                 pid, exit_status_ind = os.waitpid(-1, wait_flags)
 
         except ChildProcessError:
@@ -373,6 +412,15 @@ class EndpointManager:
                 continue
 
             try:
+                local_user_rec = pwd.getpwnam(local_user)
+            except Exception as e:
+                log.warning(
+                    f"Invalid or unknown local username.  ({e.__class__.__name__}) {e}"
+                )
+                self._command.ack(d_tag)
+                continue
+
+            try:
                 if not (command and valid_method_name_re.match(command)):
                     raise InvalidCommandError(f"Unknown or invalid command: {command}")
 
@@ -380,7 +428,7 @@ class EndpointManager:
                 if not command_func:
                     raise InvalidCommandError(f"Unknown or invalid command: {command}")
 
-                command_func(local_user, command_args, command_kwargs)
+                command_func(local_user_rec, command_args, command_kwargs)
                 log.info(
                     f"Command process successfully forked for '{globus_username}'"
                     f" ('{globus_uuid}')."
@@ -399,7 +447,7 @@ class EndpointManager:
 
     def cmd_start_endpoint(
         self,
-        local_username: str,
+        local_user_rec: pwd.struct_passwd,
         args: list[str] | None,
         kwargs: dict | None,
     ):
@@ -412,9 +460,21 @@ class EndpointManager:
         if not ep_name:
             raise InvalidCommandError("Missing endpoint name")
 
-        pw_rec = pwd.getpwnam(local_username)
-        udir, uid, gid = pw_rec.pw_dir, pw_rec.pw_uid, pw_rec.pw_gid
-        uname = pw_rec.pw_name
+        for p, n in self._running_eps:
+            if n == ep_name:
+                log.info(
+                    f"User endpoint {ep_name} is already running (pid: {p}); "
+                    "caching arguments in case it's about to shut down"
+                )
+                self._cached_cmd_start_args[p] = (local_user_rec, args, kwargs)
+                return
+
+        udir, uid, gid, uname = (
+            local_user_rec.pw_dir,
+            local_user_rec.pw_uid,
+            local_user_rec.pw_gid,
+            local_user_rec.pw_name,
+        )
 
         if not self._allow_same_user:
             p_uname = self._mt_user.pw_name
@@ -444,7 +504,8 @@ class EndpointManager:
 
         if pid > 0:
             proc_args_s = f"({uname}, {ep_name}) {' '.join(proc_args)}"
-            self._child_args[pid] = (uid, gid, local_username, proc_args_s)
+            self._child_args[pid] = (uid, gid, uname, proc_args_s)
+            self._running_eps.add((pid, ep_name))
             log.info(f"Creating new user endpoint (pid: {pid}) [{proc_args_s}]")
             return
 
