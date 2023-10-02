@@ -234,6 +234,10 @@ def version_command():
     "--display-name",
     help="A human readable display name for the endpoint, if desired",
 )
+@click.option(
+    "--auth-policy",
+    help="Endpoint users are evaluated against this Globus authentication policy",
+)
 @name_arg
 @common_options
 def configure_endpoint(
@@ -242,6 +246,7 @@ def configure_endpoint(
     endpoint_config: str | None,
     multi_tenant: bool,
     display_name: str | None,
+    auth_policy: str | None,
 ):
     """Configure an endpoint
 
@@ -258,7 +263,9 @@ def configure_endpoint(
 
     compute_dir = get_config_dir()
     ep_dir = compute_dir / name
-    Endpoint.configure_endpoint(ep_dir, endpoint_config, multi_tenant, display_name)
+    Endpoint.configure_endpoint(
+        ep_dir, endpoint_config, multi_tenant, display_name, auth_policy
+    )
 
 
 @app.command(name="start", help="Start an endpoint")
